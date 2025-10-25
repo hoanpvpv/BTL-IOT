@@ -7,13 +7,17 @@
 #include "fd_forward.h"
 #include "fr_forward.h"
 #include "fr_flash.h"
+#include "WiFi.h"
+#include <esp_now.h>
+#include "esp_wifi.h"  // Cho esp_wifi_set_channel
 
-const char* ssid = "Learn";
+const char* ssid = "ESP32-CAM-AP";
 const char* password = "12345678";
 
-#define ENROLL_CONFIRM_TIMES 3
+#define ENROLL_CONFIRM_TIMES 5
 #define FACE_ID_SAVE_NUMBER 7
-
+// 80:f3:da:5e:fc:94 mac của esp32 thường
+// d8:13:2a:7c:4c:c4 mac của esp32 CAM
 // Select camera model
 //#define CAMERA_MODEL_WROVER_KIT
 //#define CAMERA_MODEL_ESP_EYE
@@ -22,8 +26,15 @@ const char* password = "12345678";
 #define CAMERA_MODEL_AI_THINKER
 #include "camera_pins.h"
 
+
+// MAC của ESP32 Controller (sender)
+uint8_t controller_mac[] = {0x80, 0xF3, 0xDA, 0x5E, 0xFC, 0x94};
 using namespace websockets;
 WebsocketsServer socket_server;
+
+volatile bool modeWEB = false;
+
+dl_matrix3du_t *image_matrix = NULL;
 
 camera_fb_t * fb = NULL;
 
@@ -37,6 +48,9 @@ bool face_recognised = false;
 
 void app_facenet_main();
 void app_httpserver_init();
+typedef struct struct_message {
+  bool modeWEB;
+} struct_message;
 
 typedef struct
 {
@@ -45,6 +59,7 @@ typedef struct
   dl_matrix3d_t *face_id;
 } http_img_process_result;
 
+#define TAG "FACE"  // Thêm cho ESP_LOG
 
 static inline mtmn_config_t app_mtmn_config()
 {
@@ -98,6 +113,7 @@ void setup() {
   digitalWrite(relay_pin, LOW);
   pinMode(relay_pin, OUTPUT);
 
+  // cấu hình esp32cam
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -119,21 +135,10 @@ void setup() {
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  //init with high specs to pre-allocate larger buffers
-  if (psramFound()) {
-    config.frame_size = FRAMESIZE_UXGA;
-    config.jpeg_quality = 10;
-    config.fb_count = 2;
-  } else {
-    config.frame_size = FRAMESIZE_SVGA;
-    config.jpeg_quality = 12;
-    config.fb_count = 1;
-  }
-
-#if defined(CAMERA_MODEL_ESP_EYE)
-  pinMode(13, INPUT_PULLUP);
-  pinMode(14, INPUT_PULLUP);
-#endif
+  
+  config.frame_size = FRAMESIZE_SVGA; // cấu hình ảnh lúc stream 800x600
+  config.jpeg_quality = 12;
+  config.fb_count = 2;
 
   // camera init
   esp_err_t err = esp_camera_init(&config);
@@ -141,29 +146,43 @@ void setup() {
     Serial.printf("Camera init failed with error 0x%x", err);
     return;
   }
-
-  sensor_t * s = esp_camera_sensor_get();
-  s->set_framesize(s, FRAMESIZE_QVGA);
-
-#if defined(CAMERA_MODEL_M5STACK_WIDE)
-  s->set_vflip(s, 1);
-  s->set_hmirror(s, 1);
-#endif
-
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+  image_matrix = dl_matrix3du_alloc(1, 320, 240, 3);
+  if (!image_matrix) {
+      Serial.println("Khong cap phat duoc bo nho cho image_matrix");
   }
-  Serial.println("");
-  Serial.println("WiFi connected");
+  sensor_t * s = esp_camera_sensor_get();
+  s->set_framesize(s, FRAMESIZE_QVGA); // gán Thay đổi kích thước ảnh thực tế từ sensor FRAMESIZE_QVGA (320x240) pixel
+ 
+  // WiFi AP mode 
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(ssid, password,1,0,2);  
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
 
+  //Khởi tạo HTTP server và FaceNet 
   app_httpserver_init();
   app_facenet_main();
+
+
+
+  // Init ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    return;
+  }
+  esp_now_register_recv_cb(OnDataRecv);  // Đăng ký callback nhận
+  Serial.println("ESP-NOW Receiver ready. MAC: " + WiFi.macAddress());
+  delay(200);  // Delay nhỏ để AP ổn định
+
+  Serial.print("AP started! SSID: ");
+  Serial.println(ssid);
+  Serial.print("AP IP address: ");
+  Serial.println(WiFi.softAPIP());  // In IP AP 
+  
   socket_server.listen(82);
+  Serial.println("WebSocket always listening (no restart)");
 
   Serial.print("Camera Ready! Use 'http://");
-  Serial.print(WiFi.localIP());
+  Serial.print(WiFi.softAPIP());  
   Serial.println("' to connect");
 }
 
@@ -189,7 +208,7 @@ void app_httpserver_init ()
     httpd_register_uri_handler(camera_httpd, &index_uri);
   }
 }
-
+// lưu khuôn mặt đã đăng ký vào flash, lấy ra ở đây
 void app_facenet_main()
 {
   face_id_name_init(&st_face_list, FACE_ID_SAVE_NUMBER, ENROLL_CONFIRM_TIMES);
@@ -266,26 +285,53 @@ void open_door(WebsocketsClient &client) {
     door_opened_millis = millis(); // time relay closed and door opened
   }
 }
+void autoRecognitionOffline() {
+  Serial.println("da vao che do offline");
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) return;
 
-void loop() {
-  auto client = socket_server.accept();
+  fmt2rgb888(fb->buf, fb->len, fb->format, image_matrix->item);
+  box_array_t *boxes = face_detect(image_matrix, &mtmn_config);
+
+  if (boxes && align_face(boxes, image_matrix, aligned_face) == ESP_OK) {
+    dl_matrix3d_t *face_id = get_face_id(aligned_face);
+
+    if (st_face_list.count > 0) {
+      face_id_node *match = recognize_face_with_name(&st_face_list, face_id);
+      if (match) {
+        Serial.printf("offline DOOR OPEN FOR: %s\n", match->id_name);
+        if (digitalRead(relay_pin) == LOW) {
+          digitalWrite(relay_pin, HIGH);
+          door_opened_millis = millis();
+        }
+      }
+    }
+    dl_matrix3d_free(face_id);
+  }
+
+  esp_camera_fb_return(fb);
+
+  // auto close door
+  if (millis() - door_opened_millis > 5000) {
+    digitalWrite(relay_pin, LOW);
+  }
+}
+
+void loop_with_client(WebsocketsClient &client) {
   client.onMessage(handle_message);
+
   dl_matrix3du_t *image_matrix = dl_matrix3du_alloc(1, 320, 240, 3);
   http_img_process_result out_res = {0};
   out_res.image = image_matrix->item;
 
-  send_face_list(client);
-  client.send("STREAMING");
-
-  while (client.available()) {
+  while (client.available() && modeWEB) {
     client.poll();
 
-    if (millis() - interval > door_opened_millis) { // current time - face recognised time > 5 secs
-      digitalWrite(relay_pin, LOW); //open relay
+    if (millis() - interval > door_opened_millis) {
+      digitalWrite(relay_pin, LOW);
     }
 
     fb = esp_camera_fb_get();
-
     if (g_state == START_DETECT || g_state == START_ENROLL || g_state == START_RECOGNITION)
     {
       out_res.net_boxes = NULL;
@@ -361,4 +407,48 @@ void loop() {
     esp_camera_fb_return(fb);
     fb = NULL;
   }
+  dl_matrix3du_free(image_matrix);  // Free local alloc
+}
+
+
+// ESP-NOW Receive callback
+void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
+  Serial.print("Received from: ");
+  for (int i = 0; i < 6; i++) {
+    Serial.printf("%02X", mac[i]);
+    if (i < 5) Serial.print(":");
+  }
+  Serial.println();
+
+  if (len == sizeof(struct_message)) {
+    struct_message received;
+    memcpy(&received, incomingData, sizeof(received));
+    modeWEB = received.modeWEB;  // Set mode từ sender
+    Serial.printf("Mode updated to: %s\n", modeWEB ? "Web" : "Offline");  // Sửa web thành modeWEB
+  }
+}
+
+void loop() {
+  Serial.printf("Loop tick, modeWEB: %s\n", modeWEB ? "Web" : "Offline");  // Debug mode (bỏ nếu spam)
+
+  if (modeWEB) {  
+    // Web mode: Luôn poll/accept (server luôn on)
+    socket_server.poll();   // Xử lý WS không block
+    if (socket_server.available()) {  // Tránh block accept
+      auto client = socket_server.accept();
+      if (client.available()) { 
+        Serial.println("client connected"); 
+        send_face_list(client); 
+        client.send("STREAMING");
+        loop_with_client(client); // Chạy chế độ Web điều khiển 
+      } 
+    }
+  } else {
+
+    //Serial.println("vao off buoc dau");
+    autoRecognitionOffline();
+    
+  }
+  delay(100);  // Nhẹ để responsive
+  yield();
 }
