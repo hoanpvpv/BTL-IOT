@@ -10,10 +10,7 @@
 #include "WiFi.h"
 #include <esp_now.h>
 #include "esp_wifi.h"  // Cho esp_wifi_set_channel
-#include <ESP32Servo.h>
 
-Servo doorServo;          // object servo
-const int servoPin = 14;
 const char* ssid = "ESP32-CAM-AP";
 const char* password = "12345678";
 
@@ -29,9 +26,11 @@ const char* password = "12345678";
 #define CAMERA_MODEL_AI_THINKER
 #include "camera_pins.h"
 
-
-// MAC của ESP32 Controller (sender)
+// MAC của ESP32 Controller (receiver for open signal)
 uint8_t controller_mac[] = {0x80, 0xF3, 0xDA, 0x5E, 0xFC, 0x94};
+// MAC của ESP32 CAM (this device, for reference)
+uint8_t cam_mac[] = {0xd8, 0x13, 0x2a, 0x7c, 0x4c, 0xc4}; 
+
 using namespace websockets;
 WebsocketsServer socket_server;
 
@@ -43,17 +42,27 @@ camera_fb_t * fb = NULL;
 
 long current_millis;
 long last_detected_millis = 0;
+bool retryNeeded = false;
+unsigned long lastSendTime = 0;  // Thời gian gửi lần cuối
+unsigned long retryInterval = 1000;  // Retry sau 1 giây nếu fail
 
-#define relay_pin 2 // điều khiển cả door và servo nè
+#define relay_pin 2 // điều khiển cả door 
 unsigned long door_opened_millis = 0;
 long interval = 5000;           // open lock for ... milliseconds
 bool face_recognised = false;
 
 void app_facenet_main();
 void app_httpserver_init();
-typedef struct struct_message {
+typedef struct  {
   bool modeWEB;
 } struct_message;
+
+typedef struct  {
+  bool open_door;
+} open_message;
+
+// Struct để gửi tín hiệu mở cửa
+open_message door_msg;
 
 typedef struct
 {
@@ -108,20 +117,66 @@ typedef struct
 
 httpd_resp_value st_name;
 
+// Hàm gửi tín hiệu mở cửa qua ESP-NOW
+void sendOpenDoorSignal() {
+  door_msg.open_door = true;
+  esp_err_t result = esp_now_send(controller_mac, (uint8_t *) &door_msg, sizeof(door_msg));
+  if (result == ESP_OK) {
+    Serial.println("Send open door signal: Success");
+    retryNeeded = false;
+  } else {
+    Serial.println("Send open door signal: Failed");
+    retryNeeded = true;
+    lastSendTime = millis();
+  }
+}
+
+// Retry gửi nếu fail
+void checkAndRetrySend() {
+  if (retryNeeded && (millis() - lastSendTime > retryInterval)) {
+    Serial.println("Retrying send open door signal...");
+    sendOpenDoorSignal();
+  }
+}
+
+// Send callback
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  Serial.print("\r\nLast Packet Send Status:\t");
+  if (status == ESP_NOW_SEND_SUCCESS) {
+    Serial.println("Delivery Success, door OPEN");
+    retryNeeded = false;  // Thành công -> reset retry
+  } else {
+    Serial.println("Delivery Fail, retrying...");
+    retryNeeded = true;   // Fail -> cần retry
+    lastSendTime = millis();
+  }
+}
+
+// Receive callback
+void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
+  Serial.print("Received from: ");
+  for (int i = 0; i < 6; i++) {
+    Serial.printf("%02X", mac[i]);
+    if (i < 5) Serial.print(":");
+  }
+  Serial.println();
+
+  if (len == sizeof(struct_message)) {
+    struct_message received;
+    memcpy(&received, incomingData, sizeof(received));
+    modeWEB = received.modeWEB;  // Set mode từ sender
+    Serial.printf("Mode updated to: %s\n", modeWEB ? "Web" : "Offline");
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   Serial.setDebugOutput(true);
   Serial.println();
 
-  ESP32PWM::allocateTimer(1); 
-  ESP32PWM::allocateTimer(2);
-  ESP32PWM::allocateTimer(3);
-
-
   digitalWrite(relay_pin, LOW);
   pinMode(relay_pin, OUTPUT);
-  doorServo.attach(servoPin, 500, 2400);   
-  doorServo.write(0); 
+
   // cấu hình esp32cam
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -155,6 +210,7 @@ void setup() {
     Serial.printf("Camera init failed with error 0x%x", err);
     return;
   }
+
   image_matrix = dl_matrix3du_alloc(1, 320, 240, 3);
   if (!image_matrix) {
       Serial.println("Khong cap phat duoc bo nho cho image_matrix");
@@ -167,20 +223,30 @@ void setup() {
   WiFi.softAP(ssid, password,1,0,2);  
   esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
 
-  //Khởi tạo HTTP server và FaceNet 
-  app_httpserver_init();
-  app_facenet_main();
-
-
-
-  // Init ESP-NOW
+  // Init ESP-NOW (moved earlier for proper order)
   if (esp_now_init() != ESP_OK) {
     Serial.println("Error initializing ESP-NOW");
     return;
   }
+  esp_now_register_send_cb(OnDataSent);
   esp_now_register_recv_cb(OnDataRecv);  // Đăng ký callback nhận
+
+  // Thêm peer là controller MAC (để gửi tín hiệu mở cửa)
+  esp_now_peer_info_t peerInfo;
+  memcpy(peerInfo.peer_addr, controller_mac, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  if (esp_now_add_peer(&peerInfo) != ESP_OK){
+    Serial.println("Failed to add controller peer");
+    return;
+  }
+
   Serial.println("ESP-NOW Receiver ready. MAC: " + WiFi.macAddress());
   delay(200);  // Delay nhỏ để AP ổn định
+
+  //Khởi tạo HTTP server và FaceNet 
+  app_httpserver_init();
+  app_facenet_main();
 
   Serial.print("AP started! SSID: ");
   Serial.println(ssid);
@@ -290,18 +356,25 @@ void open_door(WebsocketsClient &client) {
   if (digitalRead(relay_pin) == LOW) {
     digitalWrite(relay_pin, HIGH); //close (energise) relay so door unlocks
     Serial.println("Door Unlocked");
+    // Gửi tín hiệu mở cửa qua ESP-NOW (nếu cần controller xử lý thêm)
+    sendOpenDoorSignal();
     client.send("door_open");
-    delay(60);
-    doorServo.write(90); // servo quay
     door_opened_millis = millis(); // time relay closed and door opened
   }
 }
-void autoRecognitionOffline() {
-  Serial.println("da vao che do offline");
-  camera_fb_t *fb = esp_camera_fb_get();
-  if (!fb) return;
 
-  fmt2rgb888(fb->buf, fb->len, fb->format, image_matrix->item);
+void autoRecognitionOffline() {
+  // Remove spam print - only print once if needed, e.g., static bool first = true; if(first) { Serial... first=false; }
+  static bool first_run = true;
+  if (first_run) {
+    Serial.println("Entered offline mode");
+    first_run = false;
+  }
+  
+  camera_fb_t *fb_local = esp_camera_fb_get();
+  if (!fb_local) return;
+
+  fmt2rgb888(fb_local->buf, fb_local->len, fb_local->format, image_matrix->item);
   box_array_t *boxes = face_detect(image_matrix, &mtmn_config);
 
   if (boxes && align_face(boxes, image_matrix, aligned_face) == ESP_OK) {
@@ -313,6 +386,8 @@ void autoRecognitionOffline() {
         Serial.printf("offline DOOR OPEN FOR: %s\n", match->id_name);
         if (digitalRead(relay_pin) == LOW) {
           digitalWrite(relay_pin, HIGH);
+          // Gửi tín hiệu mở cửa qua ESP-NOW
+          sendOpenDoorSignal();
           door_opened_millis = millis();
         }
       }
@@ -320,12 +395,10 @@ void autoRecognitionOffline() {
     dl_matrix3d_free(face_id);
   }
 
-  esp_camera_fb_return(fb);
+  esp_camera_fb_return(fb_local);
 
   // auto close door
   if (millis() - door_opened_millis > 5000) {
-    doorServo.write(0);
-    delay(100);
     digitalWrite(relay_pin, LOW);
   }
 }
@@ -333,12 +406,15 @@ void autoRecognitionOffline() {
 void loop_with_client(WebsocketsClient &client) {
   client.onMessage(handle_message);
 
-  dl_matrix3du_t *image_matrix = dl_matrix3du_alloc(1, 320, 240, 3);
+  dl_matrix3du_t *image_matrix_local = dl_matrix3du_alloc(1, 320, 240, 3);  // Local alloc để tránh conflict
   http_img_process_result out_res = {0};
-  out_res.image = image_matrix->item;
+  out_res.image = image_matrix_local->item;
 
   while (client.available() && modeWEB) {
     client.poll();
+
+    // Check retry nếu cần
+    checkAndRetrySend();
 
     if (millis() - interval > door_opened_millis) {
       digitalWrite(relay_pin, LOW);
@@ -352,11 +428,11 @@ void loop_with_client(WebsocketsClient &client) {
 
       fmt2rgb888(fb->buf, fb->len, fb->format, out_res.image);
 
-      out_res.net_boxes = face_detect(image_matrix, &mtmn_config);
+      out_res.net_boxes = face_detect(image_matrix_local, &mtmn_config);
 
       if (out_res.net_boxes)
       {
-        if (align_face(out_res.net_boxes, image_matrix, aligned_face) == ESP_OK)
+        if (align_face(out_res.net_boxes, image_matrix_local, aligned_face) == ESP_OK)
         {
 
           out_res.face_id = get_face_id(aligned_face);
@@ -420,29 +496,14 @@ void loop_with_client(WebsocketsClient &client) {
     esp_camera_fb_return(fb);
     fb = NULL;
   }
-  dl_matrix3du_free(image_matrix);  // Free local alloc
-}
-
-
-// ESP-NOW Receive callback
-void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
-  Serial.print("Received from: ");
-  for (int i = 0; i < 6; i++) {
-    Serial.printf("%02X", mac[i]);
-    if (i < 5) Serial.print(":");
-  }
-  Serial.println();
-
-  if (len == sizeof(struct_message)) {
-    struct_message received;
-    memcpy(&received, incomingData, sizeof(received));
-    modeWEB = received.modeWEB;  // Set mode từ sender
-    Serial.printf("Mode updated to: %s\n", modeWEB ? "Web" : "Offline");  // Sửa web thành modeWEB
-  }
+  dl_matrix3du_free(image_matrix_local);  // Free local alloc
 }
 
 void loop() {
-  Serial.printf("Loop tick, modeWEB: %s\n", modeWEB ? "Web" : "Offline");  // Debug mode (bỏ nếu spam)
+  // Remove spam print or comment out: Serial.printf("Loop tick, modeWEB: %s\n", modeWEB ? "Web" : "Offline");
+
+  // Check retry gửi ở mọi mode
+  checkAndRetrySend();
 
   if (modeWEB) {  
     // Web mode: Luôn poll/accept (server luôn on)
@@ -457,10 +518,7 @@ void loop() {
       } 
     }
   } else {
-
-    //Serial.println("vao off buoc dau");
     autoRecognitionOffline();
-    
   }
   delay(100);  // Nhẹ để responsive
   yield();
