@@ -45,6 +45,7 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
   if (status == ESP_NOW_SEND_SUCCESS) {
     Serial.println("Delivery Success");
     retryNeeded = false;  // Thành công -> reset retry
+    
   } else {
     Serial.println("Delivery Fail");
     retryNeeded = true;   // Fail -> cần retry
@@ -151,7 +152,7 @@ void loop() {
   }
 
   // ---------- Tắt LED/relay sau 20s ----------
-  if (ledState && (currentMillis - ledStartTime >= 20000)) {
+  if (ledState && !modeCAM && (currentMillis - ledStartTime >= 20000)) {
     digitalWrite(ESPCAM_CONTROL_PIN, LOW);
     ledState = false;
   }

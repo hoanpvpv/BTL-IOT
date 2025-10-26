@@ -10,7 +10,10 @@
 #include "WiFi.h"
 #include <esp_now.h>
 #include "esp_wifi.h"  // Cho esp_wifi_set_channel
+#include <ESP32Servo.h>
 
+Servo doorServo;          // object servo
+const int servoPin = 14;
 const char* ssid = "ESP32-CAM-AP";
 const char* password = "12345678";
 
@@ -41,7 +44,7 @@ camera_fb_t * fb = NULL;
 long current_millis;
 long last_detected_millis = 0;
 
-#define relay_pin 2 // pin 12 can also be used
+#define relay_pin 2 // điều khiển cả door và servo nè
 unsigned long door_opened_millis = 0;
 long interval = 5000;           // open lock for ... milliseconds
 bool face_recognised = false;
@@ -110,9 +113,15 @@ void setup() {
   Serial.setDebugOutput(true);
   Serial.println();
 
+  ESP32PWM::allocateTimer(1); 
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+
+
   digitalWrite(relay_pin, LOW);
   pinMode(relay_pin, OUTPUT);
-
+  doorServo.attach(servoPin, 500, 2400);   
+  doorServo.write(0); 
   // cấu hình esp32cam
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -282,6 +291,8 @@ void open_door(WebsocketsClient &client) {
     digitalWrite(relay_pin, HIGH); //close (energise) relay so door unlocks
     Serial.println("Door Unlocked");
     client.send("door_open");
+    delay(60);
+    doorServo.write(90); // servo quay
     door_opened_millis = millis(); // time relay closed and door opened
   }
 }
@@ -313,6 +324,8 @@ void autoRecognitionOffline() {
 
   // auto close door
   if (millis() - door_opened_millis > 5000) {
+    doorServo.write(0);
+    delay(100);
     digitalWrite(relay_pin, LOW);
   }
 }
