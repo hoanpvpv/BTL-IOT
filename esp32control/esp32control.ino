@@ -2,7 +2,6 @@
 #define BLYNK_TEMPLATE_NAME "CUA TU DONG"
 #define BLYNK_AUTH_TOKEN "2pWqFWC3yY0PPvquDQWPLCIYs5cYLFt_"
 
-
 #include <WiFi.h>
 #include <WiFiManager.h>
 #include <esp_now.h>
@@ -43,6 +42,9 @@ const unsigned long DOOR_OPEN_DURATION = 5000;  // 5 giây
 // ---------- Blynk ----------
 char auth[] = BLYNK_AUTH_TOKEN;
 bool modeCAM = false;  // trạng thái từ Switch
+
+// WiFi connection flag
+bool wifiConnected = false;
 
 // ---------- WiFiManager ----------
 WiFiManager wifiManager;
@@ -138,16 +140,23 @@ void setup() {
   wifiManager.setAPCallback(configModeCallback);
   wifiManager.setSaveConfigCallback(saveConfigCallback);
 
-  if (!wifiManager.autoConnect("ESP32-Config")) {
-    Serial.println("Không thể kết nối WiFi, ESP sẽ KO reset");
-    delay(3000);
-    ESP.restart();
-  }
-  Serial.println("Đã kết nối WiFi: " + WiFi.SSID());
+  // Set timeouts to prevent hanging
+  wifiManager.setConnectTimeout(3);  // 3 seconds for initial connection attempt
+  wifiManager.setConfigPortalTimeout(10);  //  10 seconds for config portal if needed
 
-  // ---------- Khởi tạo Blynk ----------
-  Blynk.config(auth);  // Cấu hình Blynk với auth token (sau khi WiFi đã kết nối)
-  Blynk.connect();     // Kết nối đến Blynk server (sử dụng WiFi đã có từ WiFiManager)
+  // Thử kết nối WiFi, nếu fail thì chạy ở chế độ AP mà không reset
+  wifiConnected = wifiManager.autoConnect("ESP32-Config");
+  if (wifiConnected) {
+    Serial.println("Đã kết nối WiFi: " + WiFi.SSID());
+  } else {
+    Serial.println("Không thể kết nối WiFi, chạy ở chế độ AP (offline mode)");
+  }
+
+  // Chỉ init Blynk nếu WiFi connected
+  if (wifiConnected) {
+    Blynk.config(auth);  // Cấu hình Blynk với auth token (sau khi WiFi đã kết nối)
+    Blynk.connect();     // Kết nối đến Blynk server (sử dụng WiFi đã có từ WiFiManager)
+  }
 
   // ---------- Khởi tạo ESP-NOW ----------
   if (esp_now_init() != ESP_OK) {
@@ -168,7 +177,6 @@ void setup() {
   Serial.println("ESP-NOW Receiver ready. MAC: " + WiFi.macAddress());
   
 
-
   Serial.println("Setup hoàn tất");
 
   // ---------- Khởi tạo chân ----------
@@ -184,7 +192,10 @@ void setup() {
 }
 
 void loop() {
-  Blynk.run();
+  // Chỉ chạy Blynk nếu WiFi connected
+  if (wifiConnected) {
+    Blynk.run();
+  }
 
   unsigned long currentMillis = millis();
 
